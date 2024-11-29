@@ -48,3 +48,19 @@ PPO-based reinforcement learning components:
 
 - Policy Network (Actor) - Makes decisions about reasoning steps
 - Value Network (Critic) - Evaluates the quality of those decisions
+
+Key features of this implementation:
+PPO Components:
+Reward model for evaluating reasoning quality
+Value network (Critic) for estimating state values
+PPO loss computation with clipping
+Entropy bonus for exploration
+Integration with existing model:
+Builds on top of CoT transformer
+Adds RL-specific forward pass
+Maintains compatibility with existing functionality
+Comprehensive tests:
+Shape verification
+Loss computation
+Different batch sizes
+Reward and value computation
