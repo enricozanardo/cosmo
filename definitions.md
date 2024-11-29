@@ -64,3 +64,8 @@ Shape verification
 Loss computation
 Different batch sizes
 Reward and value computation
+
+
+
+Adaptive Inference - for dynamic computation paths
+Output Generation - for text generation and completion
