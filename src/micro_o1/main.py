@@ -263,6 +263,8 @@ class ChainOfThoughtProcessor(nn.Module):
         super().__init__()
         logger.info("Initializing Chain of Thought processor")
         
+        self.hidden_size = hidden_size
+        
         # Reasoning step attention
         self.reasoning_attention = MultiHeadAttention(hidden_size, num_heads, dropout)
         self.step_norm = nn.LayerNorm(hidden_size)
@@ -276,16 +278,19 @@ class ChainOfThoughtProcessor(nn.Module):
         )
         
         # Step markers for identifying reasoning boundaries
-        self.step_start_embedding = nn.Parameter(torch.randn(1, 1, hidden_size))
-        self.step_end_embedding = nn.Parameter(torch.randn(1, 1, hidden_size))
+        self.register_parameter('step_start_embedding', 
+                              nn.Parameter(torch.randn(1, 1, hidden_size)))
+        self.register_parameter('step_end_embedding', 
+                              nn.Parameter(torch.randn(1, 1, hidden_size)))
         
-        logger.debug("CoT processor initialized")
+        logger.debug(f"CoT processor initialized with hidden_size={hidden_size}")
     
     def identify_reasoning_steps(self, hidden_states: torch.Tensor, 
                                attention_mask: torch.Tensor,
                                reason_token_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Identify and process reasoning steps in the sequence"""
-        batch_size, seq_len, _ = hidden_states.shape
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        assert hidden_dim == self.hidden_size, f"Hidden dimension mismatch: got {hidden_dim}, expected {self.hidden_size}"
         
         # Find reasoning token positions
         reason_positions = torch.nonzero(reason_token_mask, as_tuple=True)
@@ -304,28 +309,56 @@ class ChainOfThoughtProcessor(nn.Module):
                 for i in range(len(batch_reason_pos) - 1):
                     start_pos = batch_reason_pos[i]
                     end_pos = batch_reason_pos[i + 1]
+                    segment_length = end_pos - start_pos
                     
                     # Process step segment
-                    step_hidden = hidden_states[batch_idx, start_pos:end_pos]
+                    step_hidden = hidden_states[batch_idx, start_pos:end_pos]  # [seq_len, hidden_dim]
                     step_mask = attention_mask[batch_idx, start_pos:end_pos]
                     
-                    # Add step markers
-                    step_hidden = torch.cat([
-                        self.step_start_embedding.expand(1, -1, -1),
+                    # Ensure correct dimensions
+                    step_hidden = step_hidden.unsqueeze(0)  # [1, seq_len, hidden_dim]
+                    
+                    # Create step markers with correct size
+                    start_marker = self.step_start_embedding.expand(1, 1, hidden_dim)
+                    end_marker = self.step_end_embedding.expand(1, 1, hidden_dim)
+                    
+                    # Concatenate along sequence dimension
+                    step_markers = torch.cat([
+                        start_marker,
                         step_hidden,
-                        self.step_end_embedding.expand(1, -1, -1)
+                        end_marker
                     ], dim=1)
                     
                     step_masks.append(step_mask)
                     
                     # Process step with attention
-                    processed_step = self.reasoning_attention(step_hidden, step_hidden, step_hidden)
+                    processed_step = self.reasoning_attention(step_markers, step_markers, step_markers)
                     processed_step = self.step_norm(processed_step)
                     
+                    # Remove markers and ensure correct size
+                    processed_step = processed_step.squeeze(0)  # Remove batch dimension
+                    processed_step = processed_step[1:-1]  # Remove markers
+                    
+                    # Verify shapes before assignment
+                    logger.debug(f"Processed step shape: {processed_step.shape}")
+                    logger.debug(f"Target shape: [{segment_length}, {hidden_dim}]")
+                    assert processed_step.shape == (segment_length, hidden_dim), \
+                        f"Shape mismatch: got {processed_step.shape}, expected ({segment_length}, {hidden_dim})"
+                    
                     # Update hidden states
-                    processed_states[batch_idx, start_pos:end_pos] = processed_step[:, 1:-1]
+                    processed_states[batch_idx, start_pos:end_pos] = processed_step
         
-        return processed_states, torch.stack(step_masks) if step_masks else None
+        if not step_masks:
+            return processed_states, None
+            
+        # Stack masks only if we have any
+        try:
+            stacked_masks = torch.stack(step_masks)
+            logger.debug(f"Stacked masks shape: {stacked_masks.shape}")
+            return processed_states, stacked_masks
+        except:
+            logger.warning("Failed to stack masks, returning None for masks")
+            return processed_states, None
 
     def forward(self, hidden_states: torch.Tensor, 
                 attention_mask: torch.Tensor,
@@ -361,8 +394,8 @@ class MicroO1TransformerWithCoT(MicroO1Transformer):
         )
         
         # Add reasoning token embedding
-        self.reasoning_token_embedding = nn.Parameter(
-            torch.randn(1, 1, kwargs.get('hidden_size', 768))
+        self.register_parameter('reasoning_token_embedding',
+            nn.Parameter(torch.randn(1, 1, kwargs.get('hidden_size', 768)))
         )
     
     def forward(self, input_ids: torch.Tensor, 
@@ -379,6 +412,11 @@ class MicroO1TransformerWithCoT(MicroO1Transformer):
         
         # Apply Chain of Thought reasoning if reason_token_mask is provided
         if reason_token_mask is not None:
+            # Add reasoning token embeddings where reason_token_mask is 1
+            reasoning_embeds = self.reasoning_token_embedding * reason_token_mask.unsqueeze(-1)
+            x = x + reasoning_embeds
+            
+            # Apply CoT processing
             x = self.cot_processor(x, attention_mask, reason_token_mask)
         
         # Process remaining transformer layers
