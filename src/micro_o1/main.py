@@ -562,6 +562,151 @@ class MicroO1TransformerWithRL(MicroO1TransformerWithCoT):
         
         return self.norm(x)
 
+class MixedPrecisionWrapper:
+    def __init__(self, model: nn.Module, device_type: str = 'cuda', scaler: Optional[torch.amp.GradScaler] = None):
+        logger.info("Initializing Mixed Precision Wrapper")
+        self.model = model
+        self.device_type = device_type
+        
+        # Initialize scaler and dtype based on device type
+        if device_type == 'cuda':
+            self.scaler = scaler or torch.amp.GradScaler()
+            self.mixed_dtype = torch.float16
+            logger.debug("Using float16 precision with gradient scaling for CUDA")
+        else:
+            self.scaler = None
+            self.mixed_dtype = torch.float32  # Use float32 for CPU
+            logger.warning("Using float32 for CPU - true mixed precision not supported")
+        
+        # Register which modules should stay in fp32
+        self.fp32_modules = {
+            'layer_norm',  # Layer normalization should stay in fp32
+            'softmax',     # Softmax should stay in fp32
+            'loss',        # Loss computation should stay in fp32
+            'embedding'    # Embedding indices must be integers
+        }
+        
+        logger.debug(f"Mixed precision wrapper initialized for {device_type}")
+    
+    def convert_modules(self):
+        """Convert appropriate modules to mixed precision"""
+        if self.device_type == 'cuda':
+            # Only convert modules on CUDA
+            for name, module in self.model.named_modules():
+                # Skip modules that should stay in fp32
+                if any(fp32_name in name.lower() for fp32_name in self.fp32_modules):
+                    if hasattr(module, 'weight'):
+                        module.weight.data = module.weight.data.to(torch.float32)
+                    if hasattr(module, 'bias') and module.bias is not None:
+                        module.bias.data = module.bias.data.to(torch.float32)
+                    continue
+                
+                # Convert parameters to mixed precision
+                if hasattr(module, 'weight'):
+                    module.weight.data = module.weight.data.to(self.mixed_dtype)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    module.bias.data = module.bias.data.to(self.mixed_dtype)
+            
+            logger.debug("Converted modules to mixed precision on CUDA")
+        else:
+            logger.debug("Skipping module conversion on CPU")
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass with automatic mixed precision"""
+        if self.device_type == 'cuda':
+            with torch.amp.autocast(device_type=self.device_type, dtype=self.mixed_dtype):
+                return self._process_inputs_and_forward(*args, **kwargs)
+        else:
+            # On CPU, just do regular forward pass
+            return self.model.parent_forward(*args, **kwargs)
+    
+    def _process_inputs_and_forward(self, *args, **kwargs):
+        """Process inputs and perform forward pass"""
+        # Convert inputs to appropriate precision, keeping integer types for embeddings
+        processed_args = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                if arg.dtype in [torch.long, torch.int32, torch.int64]:
+                    processed_args.append(arg)
+                else:
+                    processed_args.append(arg.to(self.mixed_dtype))
+            else:
+                processed_args.append(arg)
+        
+        processed_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor):
+                if v.dtype in [torch.long, torch.int32, torch.int64]:
+                    processed_kwargs[k] = v
+                else:
+                    processed_kwargs[k] = v.to(self.mixed_dtype)
+            else:
+                processed_kwargs[k] = v
+        
+        return self.model.parent_forward(*processed_args, **processed_kwargs)
+    
+    def backward(self, loss: torch.Tensor):
+        """Backward pass with gradient scaling"""
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
+    
+    def step(self, optimizer: torch.optim.Optimizer):
+        """Optimizer step with gradient unscaling"""
+        if self.scaler is not None:
+            self.scaler.step(optimizer)
+            self.scaler.update()
+        else:
+            optimizer.step()
+    
+    def state_dict(self) -> Dict:
+        """Get state dict including scaler state"""
+        state = {'model': self.model.state_dict()}
+        if self.scaler is not None:
+            state['scaler'] = self.scaler.state_dict()
+        return state
+    
+    def load_state_dict(self, state_dict: Dict):
+        """Load state dict including scaler state"""
+        self.model.load_state_dict(state_dict['model'])
+        if self.scaler is not None and 'scaler' in state_dict:
+            self.scaler.load_state_dict(state_dict['scaler'])
+
+class MicroO1TransformerWithMixedPrecision(MicroO1TransformerWithRL):
+    def __init__(self, *args, enable_mixed_precision: bool = True, device_type: str = 'cuda', **kwargs):
+        """Initialize transformer with mixed precision support"""
+        super().__init__(*args, **kwargs)
+        logger.info("Initializing transformer with mixed precision support")
+        
+        self.enable_mixed_precision = enable_mixed_precision
+        self.device_type = device_type
+        
+        if enable_mixed_precision:
+            self.mixed_precision = MixedPrecisionWrapper(self, device_type=device_type)
+            self.mixed_precision.convert_modules()
+        
+        logger.debug(f"Mixed precision {'enabled' if enable_mixed_precision else 'disabled'}")
+    
+    def parent_forward(self, *args, **kwargs):
+        """Original forward pass from parent class"""
+        return super().forward(*args, **kwargs)
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass with optional mixed precision"""
+        if self.enable_mixed_precision:
+            return self.mixed_precision.forward(*args, **kwargs)
+        return self.parent_forward(*args, **kwargs)
+    
+    def compute_loss(self, *args, **kwargs):
+        """Compute loss with mixed precision handling"""
+        if self.enable_mixed_precision:
+            with torch.amp.autocast(device_type=self.device_type, dtype=torch.float16):
+                loss, metrics = super().compute_ppo_loss(*args, **kwargs)
+        else:
+            loss, metrics = super().compute_ppo_loss(*args, **kwargs)
+        return loss, metrics
+
 def test_tokenizer():
     """Test the tokenizer implementation"""
     # Initialize tokenizer
