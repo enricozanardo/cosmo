@@ -41,3 +41,10 @@ Do not write everything at once. Write the code step by step, commenting each pa
 
 Test each part step by step to ensure that it works correctly before continuing to the next one.
 """
+
+
+
+PPO-based reinforcement learning components:
+
+- Policy Network (Actor) - Makes decisions about reasoning steps
+- Value Network (Critic) - Evaluates the quality of those decisions
