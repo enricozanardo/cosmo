@@ -395,8 +395,7 @@ class MicroO1TransformerWithCoT(MicroO1Transformer):
         
         # Add reasoning token embedding
         self.register_parameter('reasoning_token_embedding',
-            nn.Parameter(torch.randn(1, 1, kwargs.get('hidden_size', 768)))
-        )
+                              nn.Parameter(torch.randn(1, 1, kwargs.get('hidden_size', 768))))
     
     def forward(self, input_ids: torch.Tensor, 
                 attention_mask: Optional[torch.Tensor] = None,
@@ -428,6 +427,140 @@ class MicroO1TransformerWithCoT(MicroO1Transformer):
         logits = self.output(x)
         
         return logits
+
+class PPORewardModel(nn.Module):
+    """Reward model for evaluating reasoning quality"""
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        logger.info("Initializing PPO Reward Model")
+        
+        self.reward_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, 1)
+        )
+    
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute rewards for each token"""
+        return self.reward_head(hidden_states).squeeze(-1)
+
+class PPOCritic(nn.Module):
+    """Value network for PPO"""
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        logger.info("Initializing PPO Critic")
+        
+        self.value_net = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1)
+        )
+    
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Compute value estimates"""
+        return self.value_net(hidden_states).squeeze(-1)
+
+class MicroO1TransformerWithRL(MicroO1TransformerWithCoT):
+    def __init__(self, *args, **kwargs):
+        """Initialize transformer with RL components"""
+        super().__init__(*args, **kwargs)
+        logger.info("Initializing transformer with RL components")
+        
+        hidden_size = kwargs.get('hidden_size', 768)
+        
+        # RL components
+        self.reward_model = PPORewardModel(hidden_size)
+        self.critic = PPOCritic(hidden_size)
+        
+        # PPO hyperparameters
+        self.clip_ratio = 0.2
+        self.value_loss_coef = 0.5
+        self.entropy_coef = 0.01
+        
+        logger.debug("RL components initialized")
+    
+    def compute_ppo_loss(self, 
+                        old_logits: torch.Tensor,
+                        new_logits: torch.Tensor,
+                        values: torch.Tensor,
+                        rewards: torch.Tensor,
+                        attention_mask: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Compute PPO loss components"""
+        # Compute log probabilities
+        old_probs = F.softmax(old_logits, dim=-1)
+        new_probs = F.softmax(new_logits, dim=-1)
+        
+        # Compute ratio and clipped ratio
+        ratio = (new_probs / (old_probs + 1e-8)).mean(dim=-1)
+        clipped_ratio = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
+        
+        # Compute advantages
+        with torch.no_grad():
+            advantages = rewards - values
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # Policy loss
+        policy_loss_1 = ratio * advantages
+        policy_loss_2 = clipped_ratio * advantages
+        policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(values, rewards)
+        
+        # Entropy loss for exploration
+        entropy = -(new_probs * torch.log(new_probs + 1e-8)).mean()
+        
+        # Total loss
+        total_loss = (
+            policy_loss + 
+            self.value_loss_coef * value_loss - 
+            self.entropy_coef * entropy
+        )
+        
+        # Return losses for logging
+        losses = {
+            'total_loss': total_loss.item(),
+            'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item(),
+            'entropy': entropy.item()
+        }
+        
+        return total_loss, losses
+    
+    def forward_rl(self, 
+                  input_ids: torch.Tensor,
+                  attention_mask: torch.Tensor,
+                  reason_token_mask: torch.Tensor,
+                  old_logits: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass with RL components"""
+        # Get model outputs
+        logits = self.forward(input_ids, attention_mask, reason_token_mask)
+        
+        # Get hidden states for value and reward computation
+        with torch.no_grad():
+            hidden_states = self.get_hidden_states(input_ids, attention_mask)
+        
+        # Compute values and rewards
+        values = self.critic(hidden_states)
+        rewards = self.reward_model(hidden_states)
+        
+        # Apply attention mask
+        if attention_mask is not None:
+            values = values * attention_mask
+            rewards = rewards * attention_mask
+        
+        return logits, values, rewards
+    
+    def get_hidden_states(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Get hidden states for value/reward computation"""
+        x = self.embeddings(input_ids, attention_mask)
+        
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        
+        return self.norm(x)
 
 def test_tokenizer():
     """Test the tokenizer implementation"""
