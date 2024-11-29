@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer
-from typing import List, Dict, Union, Tuple
+from typing import List, Dict, Union, Tuple, Optional
 import numpy as np
 from loguru import logger
+import math
+import torch.nn.functional as F
 
 class MicroO1Tokenizer:
     def __init__(self, model_name: str = "gpt2", max_length: int = 1024):
@@ -124,6 +126,270 @@ class MicroO1Embeddings(nn.Module):
         
         logger.debug(f"Final embeddings shape: {embeddings.shape}")
         return embeddings
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, dropout: float = 0.1):
+        """Initialize multi-head attention"""
+        super().__init__()
+        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        # Linear layers for Q, K, V projections
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        
+        self.dropout = nn.Dropout(dropout)
+        logger.debug(f"Initialized MultiHeadAttention with {num_heads} heads")
+    
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass of multi-head attention"""
+        batch_size = query.size(0)
+        
+        # Project and reshape for multi-head attention
+        q = self.q_proj(query).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(key).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(value).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        logger.debug(f"Attention scores shape: {scores.shape}")
+        
+        if attention_mask is not None:
+            scores = scores.masked_fill(attention_mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf'))
+        
+        # Apply softmax and dropout
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Compute output
+        output = torch.matmul(attn_weights, v)
+        output = output.transpose(1, 2).contiguous().view(batch_size, -1, self.hidden_size)
+        output = self.out_proj(output)
+        
+        return output
+
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int, ff_dim: int, dropout: float = 0.1):
+        """Initialize transformer block"""
+        super().__init__()
+        self.attention = MultiHeadAttention(hidden_size, num_heads, dropout)
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        
+        # Feed-forward network
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_size, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, hidden_size),
+            nn.Dropout(dropout)
+        )
+        
+        logger.debug(f"Initialized TransformerBlock with hidden_size={hidden_size}, ff_dim={ff_dim}")
+    
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass of transformer block"""
+        # Self-attention with residual connection and layer norm
+        attention_output = self.attention(x, x, x, attention_mask)
+        x = self.norm1(x + attention_output)
+        
+        # Feed-forward with residual connection and layer norm
+        ff_output = self.ff(x)
+        x = self.norm2(x + ff_output)
+        
+        return x
+
+class MicroO1Transformer(nn.Module):
+    def __init__(self, 
+                 vocab_size: int,
+                 hidden_size: int = 768,
+                 num_layers: int = 12,
+                 num_heads: int = 12,
+                 ff_dim: int = 3072,
+                 max_position_embeddings: int = 1024,
+                 dropout: float = 0.1):
+        """Initialize the transformer model"""
+        super().__init__()
+        logger.info(f"Initializing MicroO1Transformer with {num_layers} layers")
+        
+        # Embeddings
+        self.embeddings = MicroO1Embeddings(
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            max_position_embeddings=max_position_embeddings,
+            dropout=dropout
+        )
+        
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                ff_dim=ff_dim,
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+        
+        # Output layer
+        self.norm = nn.LayerNorm(hidden_size)
+        self.output = nn.Linear(hidden_size, vocab_size)
+        
+        logger.debug("MicroO1Transformer initialization complete")
+    
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass of the transformer"""
+        # Get embeddings
+        x = self.embeddings(input_ids, attention_mask)
+        
+        # Apply transformer layers
+        for layer in self.layers:
+            x = layer(x, attention_mask)
+        
+        # Apply final norm and output projection
+        x = self.norm(x)
+        logits = self.output(x)
+        
+        return logits
+
+class ChainOfThoughtProcessor(nn.Module):
+    def __init__(self, hidden_size: int, num_heads: int = 4, dropout: float = 0.1):
+        """Initialize Chain of Thought processor"""
+        super().__init__()
+        logger.info("Initializing Chain of Thought processor")
+        
+        # Reasoning step attention
+        self.reasoning_attention = MultiHeadAttention(hidden_size, num_heads, dropout)
+        self.step_norm = nn.LayerNorm(hidden_size)
+        
+        # Step aggregation
+        self.step_aggregator = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size * 2, hidden_size)
+        )
+        
+        # Step markers for identifying reasoning boundaries
+        self.step_start_embedding = nn.Parameter(torch.randn(1, 1, hidden_size))
+        self.step_end_embedding = nn.Parameter(torch.randn(1, 1, hidden_size))
+        
+        logger.debug("CoT processor initialized")
+    
+    def identify_reasoning_steps(self, hidden_states: torch.Tensor, 
+                               attention_mask: torch.Tensor,
+                               reason_token_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Identify and process reasoning steps in the sequence"""
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Find reasoning token positions
+        reason_positions = torch.nonzero(reason_token_mask, as_tuple=True)
+        logger.debug(f"Found {len(reason_positions[0])} reasoning tokens")
+        
+        # Process each reasoning step
+        processed_states = hidden_states.clone()
+        step_masks = []
+        
+        for batch_idx in range(batch_size):
+            batch_positions = reason_positions[0] == batch_idx
+            batch_reason_pos = reason_positions[1][batch_positions]
+            
+            if len(batch_reason_pos) > 0:
+                # Create step segments
+                for i in range(len(batch_reason_pos) - 1):
+                    start_pos = batch_reason_pos[i]
+                    end_pos = batch_reason_pos[i + 1]
+                    
+                    # Process step segment
+                    step_hidden = hidden_states[batch_idx, start_pos:end_pos]
+                    step_mask = attention_mask[batch_idx, start_pos:end_pos]
+                    
+                    # Add step markers
+                    step_hidden = torch.cat([
+                        self.step_start_embedding.expand(1, -1, -1),
+                        step_hidden,
+                        self.step_end_embedding.expand(1, -1, -1)
+                    ], dim=1)
+                    
+                    step_masks.append(step_mask)
+                    
+                    # Process step with attention
+                    processed_step = self.reasoning_attention(step_hidden, step_hidden, step_hidden)
+                    processed_step = self.step_norm(processed_step)
+                    
+                    # Update hidden states
+                    processed_states[batch_idx, start_pos:end_pos] = processed_step[:, 1:-1]
+        
+        return processed_states, torch.stack(step_masks) if step_masks else None
+
+    def forward(self, hidden_states: torch.Tensor, 
+                attention_mask: torch.Tensor,
+                reason_token_mask: torch.Tensor) -> torch.Tensor:
+        """Forward pass of Chain of Thought processor"""
+        logger.debug(f"Processing sequence of shape {hidden_states.shape}")
+        
+        # Process reasoning steps
+        processed_states, step_masks = self.identify_reasoning_steps(
+            hidden_states, attention_mask, reason_token_mask
+        )
+        
+        # Aggregate step information
+        if step_masks is not None:
+            aggregated = self.step_aggregator(processed_states)
+            # Combine with original hidden states
+            output = hidden_states + aggregated
+        else:
+            output = hidden_states
+        
+        logger.debug("Chain of Thought processing complete")
+        return output
+
+class MicroO1TransformerWithCoT(MicroO1Transformer):
+    def __init__(self, *args, **kwargs):
+        """Initialize transformer with Chain of Thought reasoning"""
+        super().__init__(*args, **kwargs)
+        logger.info("Initializing transformer with Chain of Thought reasoning")
+        
+        # Add CoT processor
+        self.cot_processor = ChainOfThoughtProcessor(
+            hidden_size=kwargs.get('hidden_size', 768)
+        )
+        
+        # Add reasoning token embedding
+        self.reasoning_token_embedding = nn.Parameter(
+            torch.randn(1, 1, kwargs.get('hidden_size', 768))
+        )
+    
+    def forward(self, input_ids: torch.Tensor, 
+                attention_mask: Optional[torch.Tensor] = None,
+                reason_token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Forward pass with Chain of Thought reasoning"""
+        # Get base transformer embeddings
+        x = self.embeddings(input_ids, attention_mask)
+        
+        # Process first half of transformer layers
+        mid_layer = len(self.layers) // 2
+        for layer in self.layers[:mid_layer]:
+            x = layer(x, attention_mask)
+        
+        # Apply Chain of Thought reasoning if reason_token_mask is provided
+        if reason_token_mask is not None:
+            x = self.cot_processor(x, attention_mask, reason_token_mask)
+        
+        # Process remaining transformer layers
+        for layer in self.layers[mid_layer:]:
+            x = layer(x, attention_mask)
+        
+        # Final processing
+        x = self.norm(x)
+        logits = self.output(x)
+        
+        return logits
 
 def test_tokenizer():
     """Test the tokenizer implementation"""
