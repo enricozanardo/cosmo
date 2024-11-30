@@ -52,3 +52,76 @@ def test_reasoning_embeddings(model_params):
     
     outputs = model(input_ids)
     assert outputs['logits'].shape == (1, 15, model_params['vocab_size']) 
+
+def test_reasoning_positions(model_params):
+    """Test extraction of reasoning positions"""
+    model = TransformerWithValueHead(**model_params)
+    
+    # Create input with reasoning tokens
+    input_ids = torch.zeros((1, 10), dtype=torch.long)
+    input_ids[0, 2] = model.step_token_id      # Step 1
+    input_ids[0, 5] = model.step_token_id      # Step 2
+    input_ids[0, 8] = model.therefore_token_id # Therefore
+    
+    reasoning_ids, step_positions = model._get_reasoning_positions(input_ids)
+    
+    # Check reasoning IDs
+    assert (reasoning_ids[0, 2] == 1).item()  # Step token
+    assert (reasoning_ids[0, 5] == 1).item()  # Step token
+    assert (reasoning_ids[0, 8] == 2).item()  # Therefore token
+    
+    # Check step positions
+    assert (step_positions[0, 2] == 1).item()  # First step
+    assert (step_positions[0, 5] == 2).item()  # Second step
+
+def test_value_estimation(model_params):
+    """Test value estimation with reasoning"""
+    model = TransformerWithValueHead(**model_params)
+    
+    # Create input with reasoning
+    input_ids = torch.zeros((1, 15), dtype=torch.long)
+    input_ids[0, [2, 5, 8]] = model.step_token_id  # Add steps
+    
+    outputs = model.forward(input_ids, return_value=True, use_reasoning=True)
+    
+    assert 'value' in outputs
+    assert 'reasoning_metrics' in outputs
+    assert outputs['reasoning_metrics']['num_steps'].item() == 3
+
+def test_reasoning_guided_generation(model_params):
+    """Test generation with reasoning guidance"""
+    model = TransformerWithValueHead(**model_params)
+    
+    input_ids = torch.zeros((1, 5), dtype=torch.long)
+    outputs = model.generate_with_reasoning(
+        input_ids,
+        max_length=10,
+        temperature=0.7
+    )
+    
+    assert 'generated_ids' in outputs
+    assert 'values' in outputs
+    assert 'reasoning_metrics' in outputs
+    assert len(outputs['values']) == 10  # One value per generation step
+
+def test_reasoning_embeddings_combination(model_params):
+    """Test combination of different embedding types"""
+    model = TransformerWithValueHead(**model_params)
+    
+    # Create input with reasoning tokens
+    input_ids = torch.zeros((1, 10), dtype=torch.long)
+    reasoning_ids = torch.zeros_like(input_ids)
+    step_positions = torch.zeros_like(input_ids)
+    
+    # Add some reasoning positions
+    reasoning_ids[0, [2, 5]] = 1
+    step_positions[0, [2, 5]] = torch.tensor([1, 2])
+    
+    embeddings = model._get_embeddings(
+        input_ids,
+        reasoning_ids=reasoning_ids,
+        step_positions=step_positions
+    )
+    
+    assert embeddings.shape == (1, 10, model_params['hidden_size'])
+    assert torch.isfinite(embeddings).all() 

@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from loguru import logger
 
 
@@ -19,6 +19,12 @@ class TransformerWithValueHead(nn.Module):
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
+        
+        # Token IDs for reasoning
+        self.step_token_id = 1
+        self.therefore_token_id = 2
+        self.conclusion_token_id = 3
+        self.reasoning_token_ids = [1, 2, 3]
         
         # Embeddings
         self.token_embeddings = nn.Embedding(vocab_size, hidden_size)
@@ -56,6 +62,27 @@ class TransformerWithValueHead(nn.Module):
         
         logger.info(f"Initialized transformer with {num_layers} layers and value head")
     
+    def _get_reasoning_positions(self, input_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract reasoning token positions from input"""
+        batch_size, seq_len = input_ids.size()
+        reasoning_ids = torch.zeros_like(input_ids)
+        step_positions = torch.zeros_like(input_ids)
+        
+        for i in range(batch_size):
+            step_count = 0
+            for j in range(seq_len):
+                token_id = input_ids[i, j].item()
+                if token_id == self.step_token_id:
+                    step_count += 1
+                    reasoning_ids[i, j] = 1
+                    step_positions[i, j] = step_count
+                elif token_id == self.therefore_token_id:
+                    reasoning_ids[i, j] = 2
+                elif token_id == self.conclusion_token_id:
+                    reasoning_ids[i, j] = 3
+        
+        return reasoning_ids, step_positions
+    
     def _get_embeddings(self,
                        input_ids: torch.Tensor,
                        reasoning_ids: Optional[torch.Tensor] = None,
@@ -80,112 +107,158 @@ class TransformerWithValueHead(nn.Module):
         
         return embeddings
     
+    def _estimate_reasoning_value(self, 
+                                encoder_output: torch.Tensor,
+                                reasoning_ids: torch.Tensor) -> torch.Tensor:
+        """Estimate value considering reasoning steps"""
+        reasoning_mask = reasoning_ids > 0
+        reasoning_states = encoder_output[reasoning_mask]
+        
+        if len(reasoning_states) == 0:
+            value = self.value_head(encoder_output[:, -1])
+        else:
+            step_values = self.value_head(reasoning_states)
+            value = step_values.mean(dim=0, keepdim=True)
+        
+        return value.view(1, 1)
+    
     def forward(self, 
                 input_ids: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
-                return_value: bool = False) -> Dict[str, torch.Tensor]:
-        """Forward pass with optional value estimation"""
-        # Get embeddings
-        embeddings = self._get_embeddings(input_ids)
+                return_value: bool = False,
+                use_reasoning: bool = True) -> Dict[str, torch.Tensor]:
+        """Forward pass with CoT reasoning and RL value estimation"""
+        # Get reasoning positions if needed
+        reasoning_ids = None
+        step_positions = None
+        if use_reasoning:
+            reasoning_ids, step_positions = self._get_reasoning_positions(input_ids)
         
-        # Encoder
-        if attention_mask is not None:
-            encoder_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-        else:
-            encoder_mask = None
-        
-        encoder_output = self.encoder(embeddings.transpose(0, 1), src_key_padding_mask=encoder_mask)
-        
-        # Decoder (for autoregressive generation)
-        decoder_output = self.decoder(
-            encoder_output,
-            embeddings.transpose(0, 1),
-            memory_key_padding_mask=encoder_mask
+        # Get embeddings with reasoning
+        embeddings = self._get_embeddings(
+            input_ids=input_ids,
+            reasoning_ids=reasoning_ids,
+            step_positions=step_positions
         )
         
-        # Language modeling head
-        lm_logits = self.lm_head(decoder_output.transpose(0, 1))
+        # Encoder-Decoder processing
+        encoder_output = self.encoder(embeddings)
+        decoder_output = self.decoder(encoder_output, embeddings)
+        lm_logits = self.lm_head(decoder_output)
         
         outputs = {'logits': lm_logits}
         
-        # Calculate loss if labels provided
+        # Add loss if labels provided
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
-            outputs['loss'] = loss_fct(lm_logits.view(-1, lm_logits.size(-1)), labels.view(-1))
+            outputs['loss'] = loss_fct(
+                lm_logits.view(-1, lm_logits.size(-1)),
+                labels.view(-1)
+            )
         
-        # Value estimation for RL if requested
+        # Add value estimation if requested
         if return_value:
-            # Use last hidden state for value estimation
-            value = self.value_head(encoder_output[-1])
+            if use_reasoning and reasoning_ids is not None:
+                value = self._estimate_reasoning_value(encoder_output, reasoning_ids)
+            else:
+                # Use last token's hidden state for value estimation
+                value = self.value_head(encoder_output[:, -1]).view(-1, 1)  # Shape: (batch_size, 1)
             outputs['value'] = value
+        
+        # Add reasoning metrics
+        if use_reasoning and reasoning_ids is not None:
+            outputs['reasoning_metrics'] = {
+                'num_steps': (reasoning_ids == 1).sum(1),
+                'has_conclusion': (reasoning_ids == 3).any(1),
+                'step_positions': step_positions
+            }
         
         return outputs
     
-    def _has_reasoning_tokens(self, input_ids: torch.Tensor) -> bool:
-        """Check if input contains reasoning tokens"""
-        # Check for special token IDs
-        reasoning_token_ids = {0, 1, 2, 3}  # Example IDs for reasoning tokens
-        return any(token_id in reasoning_token_ids for token_id in input_ids.unique())
-    
-    def _get_reasoning_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Get embeddings for reasoning tokens"""
-        # Map token IDs to reasoning embeddings
-        reasoning_ids = torch.zeros_like(input_ids)
-        step_positions = torch.zeros_like(input_ids)
+    def generate_with_reasoning(self,
+                              input_ids: torch.Tensor,
+                              max_length: int = 100,
+                              temperature: float = 1.0) -> Dict[str, torch.Tensor]:
+        """Generate text with CoT reasoning and RL guidance"""
+        outputs = []
+        values = []
+        current_ids = input_ids
         
-        current_step = 0
-        for i, token_id in enumerate(input_ids[0]):
-            if token_id in {1}:  # Step token
-                current_step += 1
-                reasoning_ids[0, i] = 1
-                step_positions[0, i] = current_step
-            elif token_id in {2}:  # Therefore token
-                reasoning_ids[0, i] = 2
-            elif token_id in {3}:  # Conclusion token
-                reasoning_ids[0, i] = 3
+        for _ in range(max_length):
+            # Forward pass with reasoning and value estimation
+            model_outputs = self.forward(
+                current_ids,
+                use_reasoning=True,
+                return_value=True
+            )
+            
+            # Get next token probabilities
+            next_token_logits = model_outputs['logits'][:, -1, :] / temperature
+            next_token_probs = torch.softmax(next_token_logits, dim=-1)
+            
+            # Use value to guide sampling
+            value = model_outputs['value'].item()
+            if value > 0:
+                # Boost probabilities of reasoning tokens
+                for token_id in self.reasoning_token_ids:
+                    next_token_probs[:, token_id] *= (1 + value)
+                next_token_probs = next_token_probs / next_token_probs.sum()
+            
+            # Sample next token
+            next_tokens = torch.multinomial(next_token_probs, num_samples=1)
+            outputs.append(next_tokens)
+            values.append(value)
+            
+            # Update input ids
+            current_ids = torch.cat([current_ids, next_tokens], dim=1)
         
-        reasoning_emb = self.reasoning_embeddings(reasoning_ids)
-        step_pos_emb = self.step_position_embeddings(step_positions)
-        
-        return reasoning_emb + step_pos_emb
+        return {
+            'generated_ids': torch.cat(outputs, dim=1),
+            'values': torch.tensor(values).view(-1, 1),
+            'reasoning_metrics': model_outputs.get('reasoning_metrics', {})
+        }
     
     def generate(self, 
                 input_ids: torch.Tensor,
                 max_length: int = 100,
                 temperature: float = 1.0,
                 return_value: bool = False) -> Dict[str, torch.Tensor]:
-        """Generate tokens with optional value estimation"""
-        batch_size = input_ids.size(0)
-        current_ids = input_ids
-        
+        """Basic generation without reasoning"""
         outputs = []
         values = [] if return_value else None
+        current_ids = input_ids
         
         for _ in range(max_length):
             # Forward pass
-            model_outputs = self.forward(current_ids, return_value=return_value)
+            model_outputs = self.forward(
+                current_ids,
+                return_value=return_value,
+                use_reasoning=False
+            )
             
             # Get next token probabilities
             next_token_logits = model_outputs['logits'][:, -1, :] / temperature
             next_token_probs = torch.softmax(next_token_logits, dim=-1)
             
-            # Sample next tokens
+            # Sample next token
             next_tokens = torch.multinomial(next_token_probs, num_samples=1)
-            
-            # Append to outputs
             outputs.append(next_tokens)
+            
             if return_value:
+                # Get value for current step (already has shape batch_size, 1)
                 values.append(model_outputs['value'])
             
             # Update input ids
             current_ids = torch.cat([current_ids, next_tokens], dim=1)
         
         # Combine outputs
-        generated_ids = torch.cat(outputs, dim=1)
-        result = {'generated_ids': generated_ids}
+        result = {
+            'generated_ids': torch.cat(outputs, dim=1)
+        }
         
         if return_value:
-            result['values'] = torch.cat(values, dim=0)
+            # Stack values along time dimension
+            result['values'] = torch.cat(values, dim=0)  # Shape: (max_length, 1)
         
-        return result 
+        return result
