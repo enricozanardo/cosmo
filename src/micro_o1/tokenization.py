@@ -1,6 +1,6 @@
 import torch
 from typing import List, Dict, Union
-from transformers import PreTrainedTokenizerFast
+from transformers import GPT2TokenizerFast
 from loguru import logger
 
 class MicroTokenizer:
@@ -9,40 +9,44 @@ class MicroTokenizer:
     def __init__(self, vocab_size: int = 50257):
         self.vocab_size = vocab_size
         
-        # Special tokens
+        # Special tokens with consistent naming
         self.special_tokens = {
             'pad_token': '[PAD]',
             'unk_token': '[UNK]',
             'bos_token': '[BOS]',
             'eos_token': '[EOS]',
             # Reasoning-specific tokens
-            'reason_start': '<reason>',
-            'reason_end': 'reason>',
+            'reasoning_start': '<reason>',
+            'reasoning_end': 'reason>',
             'step_token': '<step>',
             'therefore_token': '<therefore>'
         }
         
-        # Create base tokenizer
-        self.tokenizer = PreTrainedTokenizerFast(
-            vocab_size=vocab_size,
-            pad_token=self.special_tokens['pad_token'],
-            unk_token=self.special_tokens['unk_token'],
-            bos_token=self.special_tokens['bos_token'],
-            eos_token=self.special_tokens['eos_token']
-        )
+        # Initialize GPT2 tokenizer
+        self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
         
-        # Add reasoning tokens
-        self.tokenizer.add_special_tokens({
-            'additional_special_tokens': list(self.special_tokens.values())
-        })
-        
-        # Cache special token IDs
-        self.special_token_ids = {
-            name: self.tokenizer.convert_tokens_to_ids(token)
-            for name, token in self.special_tokens.items()
+        # Add special tokens
+        special_tokens_dict = {
+            'pad_token': self.special_tokens['pad_token'],
+            'additional_special_tokens': [
+                self.special_tokens['reasoning_start'],
+                self.special_tokens['reasoning_end'],
+                self.special_tokens['step_token'],
+                self.special_tokens['therefore_token']
+            ]
         }
+        self.tokenizer.add_special_tokens(special_tokens_dict)
+        
+        # Add special token attributes for easier access
+        for name, token in self.special_tokens.items():
+            setattr(self, name, token)
+        
+        # Also add direct token access
+        self.reasoning_start = self.special_tokens['reasoning_start']
+        self.reasoning_end = self.special_tokens['reasoning_end']
         
         logger.info("Initialized tokenizer with reasoning tokens")
+        logger.debug(f"Special tokens: {self.special_tokens}")
     
     def encode(self, 
                text: Union[str, List[str]], 
@@ -51,7 +55,6 @@ class MicroTokenizer:
                truncation: bool = True,
                max_length: int = 1024) -> Dict[str, torch.Tensor]:
         """Encode text to token IDs and attention mask"""
-        # Tokenize
         encoded = self.tokenizer(
             text,
             add_special_tokens=add_special_tokens,
@@ -70,12 +73,6 @@ class MicroTokenizer:
         """Decode token IDs back to text"""
         return self.tokenizer.batch_decode(token_ids, skip_special_tokens=True)
     
-    def is_reasoning_token(self, token_id: int) -> bool:
-        """Check if token ID is a reasoning token"""
-        reasoning_tokens = {
-            self.special_token_ids['reason_start'],
-            self.special_token_ids['reason_end'],
-            self.special_token_ids['step_token'],
-            self.special_token_ids['therefore_token']
-        }
-        return token_id in reasoning_tokens 
+    def get_vocab_size(self) -> int:
+        """Get the vocabulary size including special tokens"""
+        return len(self.tokenizer)

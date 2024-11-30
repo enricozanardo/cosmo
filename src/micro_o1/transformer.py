@@ -3,29 +3,40 @@ import torch.nn as nn
 from typing import Optional, Tuple, Dict
 from loguru import logger
 
+
+
 class TransformerWithValueHead(nn.Module):
     """Transformer model with value head for RL and CoT"""
     
     def __init__(self,
                  vocab_size: int,
-                 hidden_size: int = 768,
+                 hidden_size: int,
                  num_layers: int = 12,
                  num_heads: int = 12,
                  max_seq_length: int = 1024,
                  dropout: float = 0.1):
         super().__init__()
         self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
         
         # Embeddings
         self.token_embeddings = nn.Embedding(vocab_size, hidden_size)
         self.position_embeddings = nn.Embedding(max_seq_length, hidden_size)
+        self.reasoning_embeddings = nn.Embedding(4, hidden_size)  # For special tokens
+        self.step_position_embeddings = nn.Embedding(10, hidden_size)  # For reasoning steps
+        
+        # Layer norm and dropout for embeddings
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(dropout)
         
         # Encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=4 * hidden_size,
-            dropout=dropout
+            dropout=dropout,
+            batch_first=True  # Add this for better performance
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
@@ -34,19 +45,40 @@ class TransformerWithValueHead(nn.Module):
             d_model=hidden_size,
             nhead=num_heads,
             dim_feedforward=4 * hidden_size,
-            dropout=dropout
+            dropout=dropout,
+            batch_first=True  # Add this for better performance
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers)
         
         # Output heads
-        self.lm_head = nn.Linear(hidden_size, vocab_size)  # For token prediction
-        self.value_head = nn.Linear(hidden_size, 1)  # For RL value estimation
-        
-        # CoT-specific components
-        self.reasoning_embeddings = nn.Embedding(4, hidden_size)  # For special tokens
-        self.step_position_embeddings = nn.Embedding(10, hidden_size)  # For reasoning steps
+        self.lm_head = nn.Linear(hidden_size, vocab_size)
+        self.value_head = nn.Linear(hidden_size, 1)
         
         logger.info(f"Initialized transformer with {num_layers} layers and value head")
+    
+    def _get_embeddings(self,
+                       input_ids: torch.Tensor,
+                       reasoning_ids: Optional[torch.Tensor] = None,
+                       step_positions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Combine all embeddings"""
+        # Get token embeddings
+        embeddings = self.token_embeddings(input_ids)
+        
+        # Add position embeddings
+        position_ids = torch.arange(input_ids.size(1), device=input_ids.device)
+        embeddings = embeddings + self.position_embeddings(position_ids)
+        
+        # Add reasoning embeddings if present
+        if reasoning_ids is not None:
+            embeddings = embeddings + self.reasoning_embeddings(reasoning_ids)
+            if step_positions is not None:
+                embeddings = embeddings + self.step_position_embeddings(step_positions)
+        
+        # Apply layer norm and dropout
+        embeddings = self.layer_norm(embeddings)
+        embeddings = self.dropout(embeddings)
+        
+        return embeddings
     
     def forward(self, 
                 input_ids: torch.Tensor,
@@ -54,21 +86,8 @@ class TransformerWithValueHead(nn.Module):
                 labels: Optional[torch.Tensor] = None,
                 return_value: bool = False) -> Dict[str, torch.Tensor]:
         """Forward pass with optional value estimation"""
-        # First tokenize and get embeddings
-        batch_size, seq_length = input_ids.size()
-        
-        # Get reasoning token information
-        reasoning_ids = None
-        step_positions = None
-        if self._has_reasoning_tokens(input_ids):
-            reasoning_ids, step_positions = self._get_reasoning_positions(input_ids)
-        
-        # Get embeddings including reasoning if present
-        embeddings = self.embeddings(
-            input_ids=input_ids,
-            reasoning_ids=reasoning_ids,
-            step_positions=step_positions
-        )
+        # Get embeddings
+        embeddings = self._get_embeddings(input_ids)
         
         # Encoder
         if attention_mask is not None:
