@@ -109,20 +109,16 @@ class TransformerWithValueHead(nn.Module):
         
         return embeddings
     
-    def _estimate_reasoning_value(self, 
-                                encoder_output: torch.Tensor,
-                                reasoning_ids: torch.Tensor) -> torch.Tensor:
-        """Estimate value considering reasoning steps"""
-        reasoning_mask = reasoning_ids > 0
-        reasoning_states = encoder_output[reasoning_mask]
+    def _estimate_reasoning_value(self, encoder_output: torch.Tensor, reasoning_ids: torch.Tensor) -> torch.Tensor:
+        """Estimate value of reasoning steps"""
+        # Get batch size from input
+        batch_size = encoder_output.size(0)
         
-        if len(reasoning_states) == 0:
-            value = self.value_head(encoder_output[:, -1])
-        else:
-            step_values = self.value_head(reasoning_states)
-            value = step_values.mean(dim=0, keepdim=True)
+        # Get value prediction
+        value = self.value_head(encoder_output.mean(dim=1))
         
-        return value.view(1, 1)
+        # Reshape to [batch_size, 1] instead of [1, 1]
+        return value.view(batch_size, 1)
     
     def forward(self, 
                 input_ids: torch.Tensor,
@@ -183,6 +179,7 @@ class TransformerWithValueHead(nn.Module):
                               max_length: int = 100,
                               temperature: float = 1.0) -> Dict[str, torch.Tensor]:
         """Generate text with CoT reasoning and RL guidance"""
+        batch_size = input_ids.size(0)
         outputs = []
         values = []
         current_ids = input_ids
@@ -199,25 +196,32 @@ class TransformerWithValueHead(nn.Module):
             next_token_logits = model_outputs['logits'][:, -1, :] / temperature
             next_token_probs = torch.softmax(next_token_logits, dim=-1)
             
-            # Use value to guide sampling
-            value = model_outputs['value'].item()
-            if value > 0:
-                # Boost probabilities of reasoning tokens
-                for token_id in self.reasoning_token_ids:
-                    next_token_probs[:, token_id] *= (1 + value)
-                next_token_probs = next_token_probs / next_token_probs.sum()
+            # Use value to guide sampling - now handling batch dimension
+            values_batch = model_outputs['value']  # Shape: [batch_size, 1]
+            
+            # Boost probabilities of reasoning tokens for each example in batch
+            for i in range(batch_size):
+                value = values_batch[i, 0].item()  # Extract scalar value properly
+                if value > 0:
+                    # Boost probabilities of reasoning tokens for this example
+                    for token_id in self.reasoning_token_ids:
+                        next_token_probs[i, token_id] *= (1 + value)
+                    next_token_probs[i] = next_token_probs[i] / next_token_probs[i].sum()
             
             # Sample next token
             next_tokens = torch.multinomial(next_token_probs, num_samples=1)
             outputs.append(next_tokens)
-            values.append(value)
+            values.append(values_batch)  # Store the whole batch of values
             
             # Update input ids
             current_ids = torch.cat([current_ids, next_tokens], dim=1)
         
+        # Stack values along sequence dimension
+        stacked_values = torch.stack(values, dim=1)  # Changed from cat to stack
+        
         return {
             'generated_ids': torch.cat(outputs, dim=1),
-            'values': torch.tensor(values).view(-1, 1),
+            'values': stacked_values,
             'reasoning_metrics': model_outputs.get('reasoning_metrics', {})
         }
     

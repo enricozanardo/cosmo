@@ -19,7 +19,11 @@ class MicroTokenizer:
             'reasoning_start': '<reason>',
             'reasoning_end': 'reason>',
             'step_token': '<step>',
-            'therefore_token': '<therefore>'
+            'therefore_token': '<therefore>',
+            'reason_start': '<|reason|>',
+            'reason_end': 'reason|>',
+            'answer_start': '<|answer|>',
+            'answer_end': 'answer|>'
         }
         
         # Initialize GPT2 tokenizer
@@ -32,7 +36,11 @@ class MicroTokenizer:
                 self.special_tokens['reasoning_start'],
                 self.special_tokens['reasoning_end'],
                 self.special_tokens['step_token'],
-                self.special_tokens['therefore_token']
+                self.special_tokens['therefore_token'],
+                self.special_tokens['reason_start'],
+                self.special_tokens['reason_end'],
+                self.special_tokens['answer_start'],
+                self.special_tokens['answer_end']
             ]
         }
         self.tokenizer.add_special_tokens(special_tokens_dict)

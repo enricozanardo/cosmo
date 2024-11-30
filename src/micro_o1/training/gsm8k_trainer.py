@@ -50,12 +50,12 @@ class GSM8KTrainer:
             # Format with reasoning
             formatted = (
                 f"Question: {q}\n"
-                f"{tokenizer.special_tokens['reason_start']}\n"  # Use special tokens from tokenizer
+                f"{tokenizer.reasoning_start}\n"
                 f"Let's solve this step by step:\n"
                 f"{a}\n"
-                f"{tokenizer.special_tokens['therefore_token']}\n"
+                f"{tokenizer.therefore_token}\n"
                 f"Therefore, the answer is {final_answer}\n"
-                f"{tokenizer.special_tokens['reason_end']}"
+                f"{tokenizer.reasoning_end}"
             )
             inputs.append(formatted)
         
@@ -64,13 +64,20 @@ class GSM8KTrainer:
             inputs,
             padding=True,
             truncation=True,
-            max_length=1024,
-            return_tensors='pt'
+            max_length=1024
         )
         
+        # Move tensors to device and ensure they're within vocab range
+        input_ids = encoded['input_ids'].to(self.device)
+        attention_mask = encoded['attention_mask'].to(self.device)
+        
+        # Safety check - clip token IDs to vocab size
+        vocab_size = self.model.token_embeddings.num_embeddings
+        input_ids = torch.clamp(input_ids, 0, vocab_size - 1)
+        
         return {
-            'input_ids': encoded['input_ids'].to(self.device),
-            'attention_mask': encoded['attention_mask'].to(self.device)
+            'input_ids': input_ids,
+            'attention_mask': attention_mask
         }
     
     def compute_policy_loss(self,
@@ -94,10 +101,9 @@ class GSM8KTrainer:
         """Single training step with RL"""
         self.model.train()
         
-        # Generate with reasoning
+        # Generate with reasoning - removed attention_mask parameter
         outputs = self.model.generate_with_reasoning(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask']
+            input_ids=batch['input_ids']
         )
         
         # Get metrics
