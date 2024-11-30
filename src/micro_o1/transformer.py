@@ -54,16 +54,21 @@ class TransformerWithValueHead(nn.Module):
                 labels: Optional[torch.Tensor] = None,
                 return_value: bool = False) -> Dict[str, torch.Tensor]:
         """Forward pass with optional value estimation"""
-        # Get embeddings
-        token_emb = self.token_embeddings(input_ids)
-        pos_emb = self.position_embeddings(torch.arange(input_ids.size(1), device=input_ids.device))
+        # First tokenize and get embeddings
+        batch_size, seq_length = input_ids.size()
         
-        # Add CoT embeddings if present
+        # Get reasoning token information
+        reasoning_ids = None
+        step_positions = None
         if self._has_reasoning_tokens(input_ids):
-            reasoning_emb = self._get_reasoning_embeddings(input_ids)
-            embeddings = token_emb + pos_emb + reasoning_emb
-        else:
-            embeddings = token_emb + pos_emb
+            reasoning_ids, step_positions = self._get_reasoning_positions(input_ids)
+        
+        # Get embeddings including reasoning if present
+        embeddings = self.embeddings(
+            input_ids=input_ids,
+            reasoning_ids=reasoning_ids,
+            step_positions=step_positions
+        )
         
         # Encoder
         if attention_mask is not None:
