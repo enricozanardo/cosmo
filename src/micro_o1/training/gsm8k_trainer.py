@@ -101,20 +101,26 @@ class GSM8KTrainer:
         """Single training step with RL"""
         self.model.train()
         
-        # Generate with reasoning - removed attention_mask parameter
+        # Generate with reasoning - limit max_length to save memory
         outputs = self.model.generate_with_reasoning(
-            input_ids=batch['input_ids']
+            input_ids=batch['input_ids'],
+            max_length=32  # Limit generation length
         )
+        
+        # Clear unnecessary tensors
+        del batch['input_ids']
+        torch.cuda.empty_cache()
         
         # Get metrics
         reasoning_metrics = outputs['reasoning_metrics']
         num_steps = reasoning_metrics['num_steps']
         has_conclusion = reasoning_metrics['has_conclusion']
         
-        # Calculate rewards
-        rewards = torch.zeros_like(outputs['values'])
-        rewards += 0.1 * num_steps  # Reward for each reasoning step
-        rewards += 0.5 * has_conclusion  # Reward for reaching conclusion
+        # Calculate rewards on CPU to save GPU memory
+        rewards = torch.zeros_like(outputs['values'], device='cpu')
+        rewards += 0.1 * num_steps.cpu()
+        rewards += 0.5 * has_conclusion.cpu()
+        rewards = rewards.to(self.device)
         
         # Compute loss
         loss = self.compute_policy_loss(
@@ -124,9 +130,13 @@ class GSM8KTrainer:
         )
         
         # Backward pass
-        self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+        self.optimizer.zero_grad()
+        
+        # Clear memory
+        del outputs
+        torch.cuda.empty_cache()
         
         return {
             'loss': loss.item(),
@@ -143,11 +153,14 @@ class GSM8KTrainer:
             'steps': []
         }
         
+        # Reduce batch size if needed
+        batch_size = min(self.batch_size, 8)  # Smaller batch size
+        
         for step in range(self.max_steps):
             # Get batch
             batch_indices = torch.randint(
                 0, len(self.dataset['train']),
-                (self.batch_size,)
+                (batch_size,)
             )
             batch = self.dataset['train'].select(batch_indices.tolist())
             inputs = self.prepare_batch(batch)
@@ -161,6 +174,9 @@ class GSM8KTrainer:
             history['steps'].append(metrics['num_steps'])
             
             if (step + 1) % 100 == 0:
+                # Clear some memory
+                torch.cuda.empty_cache()
+                
                 logger.info(
                     f"Step {step+1}/{self.max_steps} - "
                     f"Loss: {metrics['loss']:.4f} - "
