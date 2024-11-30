@@ -14,11 +14,13 @@ class TransformerWithValueHead(nn.Module):
                  num_layers: int = 12,
                  num_heads: int = 12,
                  max_seq_length: int = 1024,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 tokenizer = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.num_heads = num_heads
+        self.tokenizer = tokenizer
         
         # Token IDs for reasoning
         self.step_token_id = 1

@@ -10,17 +10,22 @@ sys.path.insert(0, project_root)
 from src.micro_o1.transformer import TransformerWithValueHead
 from src.micro_o1.training.gsm8k_trainer import GSM8KTrainer
 from src.micro_o1.config.logging import setup_logger
+from src.micro_o1.tokenization import MicroTokenizer
 
 logger = setup_logger("training", "logs/training.log")
 
 def main():
-    # Initialize model
+    # Initialize tokenizer
+    tokenizer = MicroTokenizer(vocab_size=50257)
+    
+    # Initialize model with tokenizer
     model = TransformerWithValueHead(
         vocab_size=50257,
         hidden_size=768,
         num_layers=12,
         num_heads=12,
-        max_seq_length=1024
+        max_seq_length=1024,
+        tokenizer=tokenizer
     )
     
     # Initialize trainer
@@ -37,7 +42,11 @@ def main():
     history = trainer.train()
     
     # Save model
-    torch.save(model.state_dict(), 'gsm8k_model.pt')
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'tokenizer': tokenizer,
+        'history': history
+    }, 'gsm8k_model.pt')
     logger.info("Training completed")
 
 if __name__ == '__main__':

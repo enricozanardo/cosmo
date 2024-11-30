@@ -41,6 +41,8 @@ class GSM8KTrainer:
         
         # Format with reasoning template
         inputs = []
+        tokenizer = self.model.tokenizer  # Get tokenizer from model
+        
         for q, a in zip(questions, answers):
             # Extract numerical answer
             final_answer = a.split('####')[-1].strip()
@@ -48,17 +50,17 @@ class GSM8KTrainer:
             # Format with reasoning
             formatted = (
                 f"Question: {q}\n"
-                f"{self.model.tokenizer.reasoning_start}\n"
+                f"{tokenizer.special_tokens['reason_start']}\n"  # Use special tokens from tokenizer
                 f"Let's solve this step by step:\n"
                 f"{a}\n"
-                f"{self.model.tokenizer.therefore_token}\n"
+                f"{tokenizer.special_tokens['therefore_token']}\n"
                 f"Therefore, the answer is {final_answer}\n"
-                f"{self.model.tokenizer.reasoning_end}"
+                f"{tokenizer.special_tokens['reason_end']}"
             )
             inputs.append(formatted)
         
         # Tokenize
-        encoded = self.model.tokenizer.encode(
+        encoded = tokenizer.encode(
             inputs,
             padding=True,
             truncation=True,
