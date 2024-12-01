@@ -268,3 +268,52 @@ class TransformerWithValueHead(nn.Module):
             result['values'] = torch.cat(values, dim=0)  # Shape: (max_length, 1)
         
         return result
+    
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        # Enable gradient checkpointing for transformer layers
+        def create_encoder_forward(module):
+            def custom_forward(src, src_mask=None, src_key_padding_mask=None, 
+                             is_causal=False):
+                def closure(*inputs):
+                    return module(inputs[0], 
+                                src_mask=src_mask,
+                                src_key_padding_mask=src_key_padding_mask,
+                                is_causal=is_causal)
+                return torch.utils.checkpoint.checkpoint(
+                    closure,
+                    src,
+                    use_reentrant=False
+                )
+            return custom_forward
+
+        def create_decoder_forward(module):
+            def custom_forward(tgt, memory, tgt_mask=None, memory_mask=None,
+                             tgt_key_padding_mask=None, memory_key_padding_mask=None,
+                             tgt_is_causal=False, is_causal=False):
+                def closure(*inputs):
+                    return module(inputs[0], inputs[1],
+                                tgt_mask=tgt_mask,
+                                memory_mask=memory_mask,
+                                tgt_key_padding_mask=tgt_key_padding_mask,
+                                memory_key_padding_mask=memory_key_padding_mask,
+                                tgt_is_causal=tgt_is_causal,
+                                is_causal=is_causal)
+                return torch.utils.checkpoint.checkpoint(
+                    closure,
+                    tgt, memory,
+                    use_reentrant=False
+                )
+            return custom_forward
+
+        # Enable for encoder layers
+        for layer in self.encoder.layers:
+            original_forward = layer.forward
+            layer.forward = create_encoder_forward(original_forward)
+        
+        # Enable for decoder layers
+        for layer in self.decoder.layers:
+            original_forward = layer.forward
+            layer.forward = create_decoder_forward(original_forward)
+        
+        logger.info("Enabled gradient checkpointing")
